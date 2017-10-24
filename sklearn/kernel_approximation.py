@@ -13,82 +13,225 @@ import numpy as np
 import scipy.sparse as sp
 from scipy.linalg import svd, hadamard
 
-from .base import BaseEstimator
-from .base import TransformerMixin
-from .utils import check_array, check_random_state, as_float_array
-from .utils.extmath import safe_sparse_dot
-from .utils.validation import check_is_fitted
-from .metrics.pairwise import pairwise_kernels, KERNEL_PARAMS
+from sklearn.base import BaseEstimator
+from sklearn.base import TransformerMixin
+from sklearn.utils import check_array, check_random_state, as_float_array
+from sklearn.utils.extmath import safe_sparse_dot
+from sklearn.utils.validation import check_is_fitted
+from sklearn.metrics.pairwise import pairwise_kernels, KERNEL_PARAMS
+
+from numba import jit
+
+# Modified fastfood from http://codegist.net/snippet/python/fastfoodpy_dougalsutherland_python
+
+@jit(nopython=True)
+def fht(array_):
+    """ Pure Python implementation for educational purposes. """
+    bit = length = len(array_)
+    for _ in xrange(int(np.log2(length))):
+        bit >>= 1
+        for i in xrange(length):
+            if i & bit == 0:
+                j = i | bit
+                temp = array_[i]
+                array_[i] += array_[j]
+                array_[j] = temp - array_[j]
+                 
+@jit(nopython=True)
+def is_power_of_two(input_integer):
+    """ Test if an integer is a power of two. """
+    if input_integer == 1:
+        return False
+    return input_integer != 0 and ((input_integer & (input_integer - 1)) == 0)
+ 
+@jit(nopython=True)
+def fht2(array_):
+    """ Two dimensional row-wise FHT. """
+    if not is_power_of_two(array_.shape[1]):
+        raise ValueError('Length of rows for fht2 must be a power of two')
+ 
+    for x in xrange(array_.shape[0]):
+        fht(array_[x])
+
+
 
 class Fastfood(BaseEstimator, TransformerMixin):
     '''Computes the Fastfood feature map approximation of an RBF kernel by
-    using randomized matrices.
+    using randomized matrices: diagonal random gaussian and the hadamard 
+    transform.  This reduces computational time to O(nd) to O(d log n).
+    
+    Need n to be a power of two, if this is not true then choose the next 
+    highest power of two.
+    
     
     Parameters
     -----------
-    d : int
-        the number of features in the data.
-    random_state : int
-        random seed for random number generator.
+    sigma : float
+        Bandwidth of the RBF kernel exp(-1/2*sigma^2))*x^2
+    n_components : int
+        number of samples per original feature. Dimensionality of feature space.
+    tradeoff_mem_accuracy : choose 'accuracy' or 'mem'. Default accuracy
+        mem:        This version is not as accurate as the option "accuracy",
+                    but is consuming less memory.
+        accuracy:   The final feature space is of dimension 2*n_components,
+                    while being more accurate and consuming more memory.
+    random_state : {int, RandomState}, optional
+        If int, random_state is the seed used by the random number generator;
+        if RandomState instance, random_state is the random number generator.
         
-    
-    Notes
+   Notes
+    -----
+    See "Fastfood | Approximating Kernel Expansions in Loglinear Time" by
+    Quoc Le, Tamas Sarl and Alex Smola.
+    Examples
     ----
-    See "https://research.google.com/pubs/pub41466.html"
+    See scikit-learn-fastfood/examples/plot_digits_classification_fastfood.py
+    for an example how to use fastfood with a primal classifier in comparison
+    to an usual rbf-kernel with a dual classifier.
     
     '''
     
-    def __init__(self, d, random_state = None):
-        self.d = d
+    def __init__(self,
+                 sigma = np.sqrt(1/2),
+                 n_components = 100,
+                 random_state = None):
+        self.sigma = sigma
+        self.n_components = n_components
+        self.random_state = random_state
+        self.rng = check_random_state(self.random_state)
+        # map to 2*n_components features or to n_components features with less
+        # accuracy
+        self.tradeoff_mem_accuracy = \
+            tradeoff_mem_accuracy
+       
+    @staticmethod         
+    def enforce_dimensionality_constraints(d,n):
+        if not is_power_of_two(d):
+            d = np.power(2, np.floor(np.log2(d)) + 1)
+        divisor, remainder = divmod(n,d)
+        times_to_stack_v = int(divisor)
+        return int(d), int(n), times_to_stack_v
+    
+    def pad_with_zeros(self, X):
+        try:
+            X_padded = np.pad(X,
+                             ((0, 0),
+                               (0, self.number_of_features_to_pad_with_zeros)),
+                              'constant')
+        except AttributeError:
+            zeros = np.zeros((X.shape[0],
+                              self.number_of_features_to_pad_with_zeros))
+            X_padded = np.concatenate((X,zeros), axis=1)
+            
+        return X_padded 
+         
+    @staticmethod
+    def approx_fourier_transformation_multi_dim(result):
+        fht2(result)
         
+    @staticmethod
+    def l2norm_along_axis1(X):
+        return np.sqrt(np.einsum('ij,ij->i', X, X))
+ 
+    def uniform_vector(self):
+        if self.tradeoff_mem_accuracy != 'accuracy':
+            return self.rng.uniform(0, 2 * np.pi, size=self.n)
+        else:
+            return None                                                              
+        
+    def apply_approximate_gaussian_matrix(self, B, G, P, X):
+        """ Create mapping of all x_i by applying B, G and P step-wise """
+        num_examples = X.shape[0]
+ 
+        result = np.multiply(B, X.reshape((1, num_examples, 1, self.d)))
+        result = result.reshape((num_examples*self.times_to_stack_v, self.d))
+        Fastfood.approx_fourier_transformation_multi_dim(result)
+        result = result.reshape((num_examples, -1))
+        np.take(result, P, axis=1, mode='wrap', out=result)
+        np.multiply(np.ravel(G), result.reshape(num_examples, self.n),
+                    out=result)
+        result = result.reshape(num_examples*self.times_to_stack_v, self.d)
+        Fastfood.approx_fourier_transformation_multi_dim(result)
+        return result
+ 
+    def scale_transformed_data(self, S, VX):
+        """ Scale mapped data VX to match kernel(e.g. RBF-Kernel) """
+        VX = VX.reshape(-1, self.times_to_stack_v*self.d)
+ 
+        return (1 / (self.sigma * np.sqrt(self.d)) *
+                np.multiply(np.ravel(S), VX))
+ 
+    def phi(self, X):
+        if self.tradeoff_mem_accuracy == 'accuracy':
+            m, n = X.shape
+            out = np.empty((m, 2 * n), dtype=X.dtype)
+            np.cos(X, out=out[:, :n])
+            np.sin(X, out=out[:, n:])
+            out /= np.sqrt()
+            #return (1 / np.sqrt(X.shape[1])) * \
+            #    np.hstack([np.cos(X), np.sin(X)])
+        else:
+            np.cos(X+self.U, X)
+            return X * np.sqrt(2. / X.shape[1])
+ 
     def fit(self, X, y=None):
         """Fit the model with X.
-
-        Samples random projection according to n_features (cols of X).
-
+        Samples a couple of random based vectors to approximate a Gaussian
+        random projection matrix to generate n_components features.
         Parameters
         ----------
-        X : {array-like, sparse matrix}, shape (n_samples, n_features)
+        X : {array-like}, shape (n_samples, n_features)
             Training data, where n_samples in the number of samples
             and n_features is the number of features.
-
         Returns
         -------
         self : object
             Returns the transformer.
         """
-        
-    
+        X = check_array(X)
+ 
+        d_orig = X.shape[1]
+ 
+        self.d, self.n, self.times_to_stack_v = \
+            Fastfood.enforce_dimensionality_constraints(d_orig,
+                                                        self.n_components)
+        self.number_of_features_to_pad_with_zeros = self.d - d_orig
+ 
+        self.G = self.rng.normal(size=(self.times_to_stack_v, self.d))
+        self.B = choice([-1, 1],
+                        size=(self.times_to_stack_v, self.d),
+                        replace=True,
+                        random_state=self.random_state)
+        self.P = np.hstack([(i*self.d)+self.rng.permutation(self.d)
+                            for i in range(self.times_to_stack_v)])
+        self.S = np.multiply(1 / self.l2norm_along_axis1(self.G)
+                             .reshape((-1, 1)),
+                             chi.rvs(self.d,
+                                     size=(self.times_to_stack_v, self.d)))
+ 
+        self.U = self.uniform_vector()
+ 
+        return self
+ 
     def transform(self, X):
         """Apply the approximate feature map to X.
-
         Parameters
         ----------
-        X : {array-like, sparse matrix}, shape (n_samples, n_features)
+        X : {array-like}, shape (n_samples, n_features)
             New data, where n_samples in the number of samples
             and n_features is the number of features.
-
         Returns
         -------
         X_new : array-like, shape (n_samples, n_components)
         """
-        
-        S = np.zeros(shape=(d,d))
-        G = np.zeros_like(S)
-        B = np.zeros_like(S)
-        H = hadamard(d)
-        Pi = np.eye(d)
-        np.random.shuffle(Pi) # Permutation matrix
-    
-        
-        np.fill_diagonal(B, 2*np.random.randint(low=0,high=2,size=(d,1)).flatten() - 1)
-        np.fill_diagonal(G, np.random.randn(G.shape[0],1))  # May want to change standard normal to general distribution which will affect the scaling for V
-        np.fill_diagonal(S, np.linalg.norm(G,'fro')**(-0.5))
-        
-    
-        projection = d**(-0.5)*S.dot(H).dot(G).dot(Pi).dot(H).dot(B)
-    
-        return projection
+        X = check_array(X)
+        X_padded = self.pad_with_zeros(X)
+        HGPHBX = self.apply_approximate_gaussian_matrix(self.B,
+                                                        self.G,
+                                                        self.P,
+                                                        X_padded)
+        VX = self.scale_transformed_data(self.S, HGPHBX)
+        return self.phi(VX)
         
 
 
