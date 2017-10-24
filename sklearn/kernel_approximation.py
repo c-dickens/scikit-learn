@@ -11,7 +11,7 @@ import warnings
 
 import numpy as np
 import scipy.sparse as sp
-from scipy.linalg import svd
+from scipy.linalg import svd, hadamard
 
 from .base import BaseEstimator
 from .base import TransformerMixin
@@ -19,6 +19,77 @@ from .utils import check_array, check_random_state, as_float_array
 from .utils.extmath import safe_sparse_dot
 from .utils.validation import check_is_fitted
 from .metrics.pairwise import pairwise_kernels, KERNEL_PARAMS
+
+class Fastfood(BaseEstimator, TransformerMixin):
+    '''Computes the Fastfood feature map approximation of an RBF kernel by
+    using randomized matrices.
+    
+    Parameters
+    -----------
+    d : int
+        the number of features in the data.
+    random_state : int
+        random seed for random number generator.
+        
+    
+    Notes
+    ----
+    See "https://research.google.com/pubs/pub41466.html"
+    
+    '''
+    
+    def __init__(self, d, random_state = None):
+        self.d = d
+        
+    def fit(self, X, y=None):
+        """Fit the model with X.
+
+        Samples random projection according to n_features (cols of X).
+
+        Parameters
+        ----------
+        X : {array-like, sparse matrix}, shape (n_samples, n_features)
+            Training data, where n_samples in the number of samples
+            and n_features is the number of features.
+
+        Returns
+        -------
+        self : object
+            Returns the transformer.
+        """
+        
+    
+    def transform(self, X):
+        """Apply the approximate feature map to X.
+
+        Parameters
+        ----------
+        X : {array-like, sparse matrix}, shape (n_samples, n_features)
+            New data, where n_samples in the number of samples
+            and n_features is the number of features.
+
+        Returns
+        -------
+        X_new : array-like, shape (n_samples, n_components)
+        """
+        
+        S = np.zeros(shape=(d,d))
+        G = np.zeros_like(S)
+        B = np.zeros_like(S)
+        H = hadamard(d)
+        Pi = np.eye(d)
+        np.random.shuffle(Pi) # Permutation matrix
+    
+        
+        np.fill_diagonal(B, 2*np.random.randint(low=0,high=2,size=(d,1)).flatten() - 1)
+        np.fill_diagonal(G, np.random.randn(G.shape[0],1))  # May want to change standard normal to general distribution which will affect the scaling for V
+        np.fill_diagonal(S, np.linalg.norm(G,'fro')**(-0.5))
+        
+    
+        projection = d**(-0.5)*S.dot(H).dot(G).dot(Pi).dot(H).dot(B)
+    
+        return projection
+        
 
 
 class RBFSampler(BaseEstimator, TransformerMixin):
